@@ -2,6 +2,7 @@
 
 import contextlib
 from collections import OrderedDict
+from typing import Any
 
 from nautobot.apps.jobs import Job, StringVar
 from nautobot.core.celery import register_jobs
@@ -37,8 +38,24 @@ STRIP_KEYWORDS = {
     "interfaces": ["poe_mode", "poe_type"],
 }
 
+RENAME_COMPONENT_PARAMS = {
+    "power-outlets": {
+        "power_port": "power_port_template",
+    },
+    "front-ports": {
+        "rear_port": "rear_port_template",
+    },
+}
 
-def import_device_type(data):
+# Component groups whose items reference a sibling template by name, keyed to the FK
+# field (post-rename) and the model to resolve it against.
+FK_PARENT_LOOKUP = {
+    "power-outlets": ("power_port_template", PowerPortTemplate),
+    "front-ports": ("rear_port_template", RearPortTemplate),
+}
+
+
+def import_device_type(data: dict[str, Any]) -> DeviceType:
     """Import DeviceType."""
     manufacturer = Manufacturer.objects.get(name=data.get("manufacturer"))
     model = data.get("model")
@@ -52,15 +69,36 @@ def import_device_type(data):
 
     # Import All Components
     for key, component_class in COMPONENTS.items():
-        if key in data:
-            component_list = [
-                component_class(
-                    device_type=devtype,
-                    **{k: v for k, v in item.items() if k not in STRIP_KEYWORDS.get(key, [])},
-                )
-                for item in data[key]
-            ]
-            component_class.objects.bulk_create(component_list)
+        if key not in data:
+            continue
+        renames = RENAME_COMPONENT_PARAMS.get(key, {})
+        fk_lookup = FK_PARENT_LOOKUP.get(key)
+        component_list = []
+        for raw_item in data[key]:
+            component_kwargs = {k: v for k, v in raw_item.items() if k not in STRIP_KEYWORDS.get(key, [])}
+            for legacy_key, renamed_key in renames.items():
+                if legacy_key in component_kwargs:
+                    component_kwargs[renamed_key] = component_kwargs.pop(legacy_key)
+            if fk_lookup:
+                fk_field, fk_model = fk_lookup
+                nullable = fk_model is PowerPortTemplate
+                parent_name = component_kwargs.get(fk_field)
+                if parent_name is None and not nullable:
+                    msg = f"Unable to import {key} item on {devtype}: missing required {fk_field!r} value."
+                    raise ValueError(msg)
+                try:
+                    component_kwargs[fk_field] = fk_model.objects.get(device_type=devtype, name=parent_name)
+                except fk_model.DoesNotExist:
+                    if nullable:
+                        component_kwargs[fk_field] = None
+                    else:
+                        msg = (
+                            f"Unable to import {key} item on {devtype}: "
+                            f"no {fk_model.__name__} named {parent_name!r} found."
+                        )
+                        raise ValueError(msg) from None
+            component_list.append(component_class(device_type=devtype, **component_kwargs))
+        component_class.objects.bulk_create(component_list)
     return devtype
 
 
@@ -100,8 +138,7 @@ class WelcomeWizardImportDeviceType(Job):
 
     def run(self, filename):  # pylint: disable=arguments-differ
         """Tries to import the selected Device Type into Nautobot."""
-        # device_type = data.get("device_type_filename", "none.yaml")
-        device_type = filename if filename else "none.yaml"
+        device_type = filename or "none.yaml"
 
         device_type_data = DeviceTypeImport.objects.filter(filename=device_type)[0].device_type_data
 
