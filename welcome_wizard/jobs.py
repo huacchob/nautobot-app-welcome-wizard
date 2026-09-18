@@ -55,6 +55,33 @@ FK_PARENT_LOOKUP = {
 }
 
 
+def _build_component_kwargs(key: str, raw_item: dict[str, Any], devtype: DeviceType) -> dict[str, Any]:
+    """Rename legacy component fields and resolve FK references to sibling templates on `devtype`."""
+    kwargs = {k: v for k, v in raw_item.items() if k not in STRIP_KEYWORDS.get(key, [])}
+    for legacy_key, renamed_key in RENAME_COMPONENT_PARAMS.get(key, {}).items():
+        if legacy_key in kwargs:
+            kwargs[renamed_key] = kwargs.pop(legacy_key)
+
+    fk_lookup = FK_PARENT_LOOKUP.get(key)
+    if not fk_lookup:
+        return kwargs
+
+    fk_field, fk_model = fk_lookup
+    nullable = fk_model is PowerPortTemplate
+    parent_name = kwargs.get(fk_field)
+    if parent_name is None and not nullable:
+        raise ValueError(f"Unable to import {key} item on {devtype}: missing required {fk_field!r} value.")
+    try:
+        kwargs[fk_field] = fk_model.objects.get(device_type=devtype, name=parent_name)
+    except fk_model.DoesNotExist:
+        if not nullable:
+            raise ValueError(
+                f"Unable to import {key} item on {devtype}: no {fk_model.__name__} named {parent_name!r} found."
+            ) from None
+        kwargs[fk_field] = None
+    return kwargs
+
+
 def import_device_type(data: dict[str, Any]) -> DeviceType:
     """Import DeviceType."""
     manufacturer = Manufacturer.objects.get(name=data.get("manufacturer"))
@@ -64,40 +91,16 @@ def import_device_type(data: dict[str, Any]) -> DeviceType:
         raise ValueError(
             f"Unable to import this device_type, a DeviceType with this model ({model}) and manufacturer ({manufacturer}) already exist."
         )
-    dtif = DeviceTypeImportForm(data)
-    devtype = dtif.save()
+    devtype = DeviceTypeImportForm(data).save()
 
     # Import All Components
     for key, component_class in COMPONENTS.items():
         if key not in data:
             continue
-        renames = RENAME_COMPONENT_PARAMS.get(key, {})
-        fk_lookup = FK_PARENT_LOOKUP.get(key)
-        component_list = []
-        for raw_item in data[key]:
-            component_kwargs = {k: v for k, v in raw_item.items() if k not in STRIP_KEYWORDS.get(key, [])}
-            for legacy_key, renamed_key in renames.items():
-                if legacy_key in component_kwargs:
-                    component_kwargs[renamed_key] = component_kwargs.pop(legacy_key)
-            if fk_lookup:
-                fk_field, fk_model = fk_lookup
-                nullable = fk_model is PowerPortTemplate
-                parent_name = component_kwargs.get(fk_field)
-                if parent_name is None and not nullable:
-                    msg = f"Unable to import {key} item on {devtype}: missing required {fk_field!r} value."
-                    raise ValueError(msg)
-                try:
-                    component_kwargs[fk_field] = fk_model.objects.get(device_type=devtype, name=parent_name)
-                except fk_model.DoesNotExist:
-                    if nullable:
-                        component_kwargs[fk_field] = None
-                    else:
-                        msg = (
-                            f"Unable to import {key} item on {devtype}: "
-                            f"no {fk_model.__name__} named {parent_name!r} found."
-                        )
-                        raise ValueError(msg) from None
-            component_list.append(component_class(device_type=devtype, **component_kwargs))
+        component_list = [
+            component_class(device_type=devtype, **_build_component_kwargs(key, raw_item, devtype))
+            for raw_item in data[key]
+        ]
         component_class.objects.bulk_create(component_list)
     return devtype
 
