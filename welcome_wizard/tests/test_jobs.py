@@ -188,3 +188,27 @@ class TestWelcomeWizardJobs(TransactionTestCase):
             "Unable to import front-ports item on MX80-BadFront: no RearPortTemplate named 'DoesNotExist' found.",
             log_entries,
         )
+
+    def test_welcome_wizard_import_devicetype_front_port_missing_rear_port_is_hard_error(self):
+        """A front-port with no `rear_port` value at all fails the job instead of saving a null FK."""
+        manufacturer = ManufacturerImport.objects.create(name="Juniper")
+        Manufacturer.objects.create(name="Juniper")
+        DeviceTypeImport.objects.create(
+            name="MX80-MissingFront",
+            filename="MX80-MissingFront.yaml",
+            manufacturer=manufacturer,
+            device_type_data={
+                "manufacturer": "Juniper",
+                "model": "MX80-MissingFront",
+                "is_full_depth": True,
+                "u_height": 2,
+                "front-ports": [{"name": "Front1", "type": "lc", "rear_port_position": 1}],
+            },
+        )
+
+        job_result = run_job_for_testing(self.import_devicetype_job, dryrun=False, filename="MX80-MissingFront.yaml")
+        log_entries = [log_entry.message for log_entry in JobLogEntry.objects.filter(job_result=job_result)]
+        self.assertIn(
+            "Unable to import front-ports item on MX80-MissingFront: missing required 'rear_port_template' value.",
+            log_entries,
+        )
